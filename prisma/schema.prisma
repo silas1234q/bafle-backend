@@ -1,0 +1,792 @@
+// Bafle — raffle-based marketplace.
+//
+// MONEY: every amount is an integer in **pesewas** (GHS minor unit, 100 per
+// cedi). Never a float. `Int` (not `BigInt`) is deliberate: it caps a single
+// row at ~GHS 21.4m, far above any ticket or product, and keeps values
+// JSON-serialisable — BigInt throws in JSON.stringify.
+//
+// The connection URL lives in prisma.config.ts (datasource.url).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+
+  runtime      = "nodejs"
+  moduleFormat = "esm"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  USER
+  MODERATOR
+  ADMIN
+}
+
+enum KycStatus {
+  UNSUBMITTED
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model User {
+  id String @id @default(uuid())
+
+  // Clerk is the identity provider: it owns credentials, sessions and email
+  // verification. This row is our local mirror, joined on clerkUserId, so
+  // the rest of the domain can hold foreign keys to a stable internal id.
+  clerkUserId String @unique
+
+  email String   @unique
+  phone String?  @unique // E.164, e.g. +233...
+  role  UserRole @default(USER)
+
+  // Signup collects an email and nothing else, so we assign a username.
+  // Null usernameUpdatedAt means it is still the generated default.
+  username          String    @unique
+  usernameUpdatedAt DateTime?
+
+  displayName String?
+  avatarUrl   String?
+
+  emailVerifiedAt DateTime?
+  phoneVerifiedAt DateTime?
+
+  // Required before a first payout, not before buying tickets.
+  kycStatus     KycStatus @default(UNSUBMITTED)
+  kycReviewedAt DateTime?
+
+  // Soft-lock for fraud review; blocks selling and payouts.
+  suspendedAt     DateTime?
+  suspendedReason String?
+
+  sellerProfile    SellerProfile?
+  products         Product[]
+  tickets          Ticket[]
+  payments         Payment[]
+  addresses        Address[]
+  wonDraws         Draw[]
+  wonOrders        Order[]        @relation("OrderWinner")
+  soldOrders       Order[]        @relation("OrderSeller")
+  payouts          Payout[]
+  ledgerAccount    Account[]
+  disputesOpened   Dispute[]      @relation("DisputeRaiser")
+  disputesResolved Dispute[]      @relation("DisputeResolver")
+  auditLogs        AuditLog[]
+  notifications    Notification[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([kycStatus])
+}
+
+// Where a seller gets paid.
+//
+// Paystack used to hold the account itself and hand back an opaque recipient
+// code, so this table could not leak a MoMo number. Moolre's transfer endpoint
+// takes the raw receiver on every call, so the number has to live here —
+// encrypted, in payoutDestinationCipher, and never selected into a response.
+// providerRecipientCode is now derived locally (lib/payoutSecrets.ts) and stays
+// unique, which is what makes a second seller claiming someone else's wallet
+// fail as DESTINATION_TAKEN rather than quietly succeed.
+model SellerProfile {
+  id     String @id @default(uuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  businessName String?
+
+  providerRecipientCode   String? @unique
+  // "mobile_money" dominates in Ghana; "nuban"/bank also supported.
+  recipientType           String?
+  bankCode                String?
+  accountNameSnapshot     String?
+  accountNumberLast4      String?
+  // AES-256-GCM, see lib/payoutSecrets.ts. Null for a profile onboarded under
+  // a provider that issued its own recipient handle.
+  payoutDestinationCipher String?
+
+  payoutsEnabled Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// NOTE: there is deliberately no Session or VerificationToken table, and no
+// passwordHash on User. Clerk owns sessions, password reset and email
+// verification — mirroring any of that here would mean storing credentials we
+// have no reason to hold.
+
+model Address {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  recipientName  String
+  phone          String
+  line1          String
+  line2          String?
+  city           String
+  region         String
+  // GhanaPost GPS digital address, e.g. "GA-123-4567".
+  digitalAddress String?
+  country        String  @default("GH")
+
+  isDefault Boolean @default(false)
+  orders    Order[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Catalogue
+// ---------------------------------------------------------------------------
+
+enum ProductStatus {
+  DRAFT
+  PENDING_REVIEW
+  ACTIVE
+  REJECTED
+  ARCHIVED
+}
+
+enum ProductCondition {
+  NEW
+  REFURBISHED
+  USED
+}
+
+model Product {
+  id       String @id @default(uuid())
+  sellerId String
+  seller   User   @relation(fields: [sellerId], references: [id])
+
+  title       String
+  slug        String           @unique
+  description String
+  category    String
+  condition   ProductCondition @default(NEW)
+
+  // Seller's stated retail value, in pesewas. Used to sanity-check that
+  // ticketPrice * totalTickets is not wildly above market.
+  retailValue Int
+
+  status           ProductStatus @default(DRAFT)
+  moderationNotes  String?
+  reviewedByUserId String?
+  reviewedAt       DateTime?
+
+  images  ProductImage[]
+  raffles Raffle[]
+  orders  Order[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sellerId, status])
+  @@index([status, createdAt])
+}
+
+model ProductImage {
+  id        String  @id @default(uuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  url      String
+  alt      String?
+  position Int     @default(0)
+
+  createdAt DateTime @default(now())
+
+  @@unique([productId, position])
+}
+
+// ---------------------------------------------------------------------------
+// Raffle
+// ---------------------------------------------------------------------------
+
+enum RaffleStatus {
+  DRAFT
+  OPEN
+  SOLD_OUT // all tickets paid, draw not yet executed
+  DRAWN // winner selected, awaiting fulfilment
+  EXPIRED // closesAt passed without selling out
+  REFUNDING
+  REFUNDED
+  CANCELLED
+  COMPLETED // delivered, confirmed, seller paid
+}
+
+model Raffle {
+  id        String  @id @default(uuid())
+  productId String
+  product   Product @relation(fields: [productId], references: [id])
+  sellerId  String // denormalised from product for seller dashboards
+
+  ticketPrice  Int // pesewas
+  totalTickets Int
+  // Maintained inside the same transaction that inserts a Ticket, under a
+  // `SELECT ... FOR UPDATE` on this row. Display/guard only — the real
+  // oversell guard is Ticket's unique (raffleId, ticketNumber).
+  ticketsSold  Int @default(0)
+
+  status RaffleStatus @default(DRAFT)
+
+  opensAt  DateTime?
+  // Deadline. If not sold out by this point the raffle expires and every
+  // paid ticket is refunded.
+  closesAt DateTime
+
+  // When the draw is scheduled to run. Set at the moment the last ticket is
+  // paid for, to DRAW_DELAY_MS after the sellout — the gap exists so entrants
+  // can be told the draw is imminent instead of finding it already decided.
+  // Null until then. The draw itself is a job; this is also what the
+  // `drawDueRaffles` sweep selects on, so a lost job still gets drawn.
+  drawAt DateTime?
+
+  platformFeeBps Int @default(0) // basis points withheld on payout
+
+  tickets       Ticket[]
+  payments      Payment[]
+  draw          Draw?
+  order         Order?
+  ledgerEntries LedgerEntry[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, closesAt])
+  @@index([sellerId])
+  @@index([productId])
+}
+
+enum TicketStatus {
+  RESERVED // held during checkout, expires if payment never completes
+  PAID
+  REFUNDED
+  VOID
+}
+
+model Ticket {
+  id       String @id @default(uuid())
+  raffleId String
+  raffle   Raffle @relation(fields: [raffleId], references: [id], onDelete: Cascade)
+  userId   String
+  user     User   @relation(fields: [userId], references: [id])
+
+  // 1..totalTickets. The unique constraint below is what makes overselling
+  // the final ticket impossible, regardless of application-level races.
+  ticketNumber Int
+  status       TicketStatus @default(RESERVED)
+
+  paymentId String?
+  payment   Payment? @relation(fields: [paymentId], references: [id])
+
+  reservationExpiresAt DateTime?
+  paidAt               DateTime?
+  refundedAt           DateTime?
+
+  wonDraw Draw?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([raffleId, ticketNumber])
+  @@index([raffleId, status])
+  @@index([userId])
+  @@index([status, reservationExpiresAt])
+}
+
+// ---------------------------------------------------------------------------
+// Payments
+// ---------------------------------------------------------------------------
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  ABANDONED
+  REVERSED
+}
+
+model Payment {
+  id       String  @id @default(uuid())
+  userId   String
+  user     User    @relation(fields: [userId], references: [id])
+  raffleId String?
+  raffle   Raffle? @relation(fields: [raffleId], references: [id])
+
+  // Our own reference, sent to the provider as its own reference. Unique so a
+  // retried initialise can never double-charge.
+  reference         String  @unique
+  providerReference String? @unique
+
+  amount   Int // pesewas, total for the whole basket
+  currency String @default("GHS")
+  quantity Int // tickets purchased
+
+  status  PaymentStatus @default(PENDING)
+  channel String?
+  // The provider's own fee, recorded so the ledger reconciles against settlement.
+  pspFee  Int?
+
+  authorizationUrl String?
+  paidAt           DateTime?
+  failureReason    String?
+
+  // Where to send the money back if this raffle never sells out.
+  //
+  // Captured from the verified payment callback, because that is the ONLY place
+  // the payer is disclosed — the status endpoint returns an empty payer. A
+  // provider with no refund endpoint refunds by transferring back, so without
+  // these a paid ticket cannot be refunded automatically at all, and
+  // refundRaffle records no_refund_destination for a human instead.
+  //
+  // Encrypted (lib/payoutSecrets.ts) and never selected into a response.
+  refundDestinationCipher String?
+  // Provider channel code the payment arrived on, so the refund goes back out
+  // on the same network. "2" means a bank; anything else is mobile money.
+  refundChannel           String?
+  payerNameSnapshot       String?
+
+  tickets       Ticket[]
+  refunds       Refund[]
+  ledgerEntries LedgerEntry[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, status])
+  @@index([raffleId, status])
+}
+
+enum RefundStatus {
+  PENDING
+  PROCESSING
+  SUCCEEDED
+  FAILED
+}
+
+model Refund {
+  id        String  @id @default(uuid())
+  paymentId String
+  payment   Payment @relation(fields: [paymentId], references: [id])
+
+  reference        String       @unique
+  providerRefundId String?      @unique
+  amount           Int
+  reason           String
+  status           RefundStatus @default(PENDING)
+  failureReason    String?
+  settledAt        DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([paymentId, status])
+}
+
+// Every inbound provider webhook, recorded before processing. Providers
+// retry, so `eventId` is unique and handlers are keyed off it to stay
+// idempotent. Authenticity is verified before anything is trusted.
+model WebhookEvent {
+  id       String @id @default(uuid())
+  provider String @default("paystack")
+
+  eventId   String @unique
+  eventType String
+
+  signatureValid Boolean
+  payload        Json
+
+  processedAt     DateTime?
+  processingError String?
+  attempts        Int       @default(0)
+
+  receivedAt DateTime @default(now())
+
+  @@index([eventType, processedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Draw
+// ---------------------------------------------------------------------------
+
+// Immutable record of a completed draw. The winner is selected by the platform
+// from the paid ticket set; `raffleId` is unique and an existing row is never
+// replaced, so a raffle has exactly one outcome for its whole life.
+model Draw {
+  id       String @id @default(uuid())
+  raffleId String @unique
+  raffle   Raffle @relation(fields: [raffleId], references: [id])
+
+  // Size of the eligible pool at the moment of the draw. Kept on the row
+  // rather than recounted, so the recorded outcome stays self-describing even
+  // if tickets are later voided or refunded.
+  ticketCount Int
+
+  winningTicketNumber Int
+  winningTicketId     String @unique
+  winningTicket       Ticket @relation(fields: [winningTicketId], references: [id])
+
+  winnerUserId String
+  winner       User   @relation(fields: [winnerUserId], references: [id])
+
+  drawnAt DateTime @default(now())
+
+  @@index([winnerUserId])
+}
+
+// ---------------------------------------------------------------------------
+// Fulfilment
+// ---------------------------------------------------------------------------
+
+enum OrderStatus {
+  AWAITING_ADDRESS
+  AWAITING_SHIPMENT
+  SHIPPED
+  DELIVERED // OTP redeemed
+  CONFIRMED // funds released to seller
+  DISPUTED
+  REFUNDED
+  CANCELLED
+}
+
+model Order {
+  id       String @id @default(uuid())
+  raffleId String @unique
+  raffle   Raffle @relation(fields: [raffleId], references: [id])
+
+  productId    String
+  product      Product @relation(fields: [productId], references: [id])
+  winnerUserId String
+  winner       User    @relation("OrderWinner", fields: [winnerUserId], references: [id])
+  sellerId     String
+  seller       User    @relation("OrderSeller", fields: [sellerId], references: [id])
+
+  status OrderStatus @default(AWAITING_ADDRESS)
+
+  addressId String?
+  address   Address? @relation(fields: [addressId], references: [id])
+
+  courier        String?
+  trackingNumber String?
+
+  // Delivery OTP: the winner holds a one-time code and reads it to the
+  // courier on handover. Only the hash is stored, so a DB read cannot be used
+  // to self-confirm a delivery that never happened.
+  deliveryOtpHash      String?
+  deliveryOtpExpiresAt DateTime?
+  deliveryOtpAttempts  Int       @default(0)
+
+  shippedAt   DateTime?
+  deliveredAt DateTime?
+  confirmedAt DateTime?
+
+  // Fallback so a silent winner cannot strand the seller's money forever.
+  autoReleaseAt DateTime?
+
+  // Seller's gross, fee and net at the moment of accrual, in pesewas.
+  grossAmount Int?
+  platformFee Int?
+  netAmount   Int?
+
+  payout        Payout?
+  disputes      Dispute[]
+  ledgerEntries LedgerEntry[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, autoReleaseAt])
+  @@index([sellerId, status])
+  @@index([winnerUserId, status])
+}
+
+enum PayoutStatus {
+  PENDING
+  QUEUED
+  PROCESSING
+  PAID
+  FAILED
+  REVERSED
+}
+
+model Payout {
+  id       String @id @default(uuid())
+  orderId  String @unique
+  order    Order  @relation(fields: [orderId], references: [id])
+  sellerId String
+  seller   User   @relation(fields: [sellerId], references: [id])
+
+  amount   Int // net, pesewas
+  currency String @default("GHS")
+
+  reference             String       @unique
+  providerTransferCode  String?      @unique
+  providerRecipientCode String?
+  // What the provider charged US to send this, in pesewas. Unlike a collection
+  // fee (Payment.pspFee) this is charged ON TOP: the seller receives "amount"
+  // and our cash drops by "amount + feeMinor". Null when the provider reports
+  // no fee, which is not the same as zero.
+  feeMinor              Int?
+  status                PayoutStatus @default(PENDING)
+  failureReason         String?
+  paidAt                DateTime?
+
+  ledgerEntries LedgerEntry[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sellerId, status])
+  @@index([status, createdAt])
+}
+
+enum DisputeStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED_FOR_WINNER
+  RESOLVED_FOR_SELLER
+  WITHDRAWN
+}
+
+model Dispute {
+  id      String @id @default(uuid())
+  orderId String
+  order   Order  @relation(fields: [orderId], references: [id])
+
+  raisedByUserId String
+  raisedBy       User   @relation("DisputeRaiser", fields: [raisedByUserId], references: [id])
+
+  reason   String
+  evidence Json?
+
+  status           DisputeStatus @default(OPEN)
+  resolution       String?
+  resolvedByUserId String?
+  resolvedBy       User?         @relation("DisputeResolver", fields: [resolvedByUserId], references: [id])
+  resolvedAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([orderId])
+  @@index([status, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Ledger (double-entry)
+// ---------------------------------------------------------------------------
+// Escrow means holding money that is not ours. `order.status` is a workflow
+// flag, not an accounting record — this is the source of truth for whose
+// money is where. Entries of one LedgerTransaction must sum to zero; a
+// deferred trigger in the migration enforces it at COMMIT.
+
+enum AccountType {
+  PLATFORM_CASH // asset: funds in our balance with the payment provider
+  TICKET_ESCROW // liability: ticket money held for undecided raffles
+  SELLER_PAYABLE // liability: owed to a seller after confirmation
+  BUYER_REFUND_PAYABLE // liability: owed back to ticket buyers
+  PLATFORM_REVENUE // income: our fee
+  PSP_FEES // expense: payment provider charges
+}
+
+model Account {
+  id   String      @id @default(uuid())
+  type AccountType
+
+  // Set for per-user accounts (SELLER_PAYABLE, BUYER_REFUND_PAYABLE);
+  // null for the platform-level singletons.
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id])
+
+  currency String @default("GHS")
+
+  entries LedgerEntry[]
+
+  createdAt DateTime @default(now())
+
+  @@unique([type, userId])
+}
+
+enum LedgerTransactionType {
+  TICKET_PURCHASE
+  TICKET_REFUND
+  PAYOUT_ACCRUAL // escrow -> seller payable + platform revenue
+  SELLER_PAYOUT
+  PSP_FEE
+  ADJUSTMENT
+}
+
+model LedgerTransaction {
+  id          String                @id @default(uuid())
+  type        LedgerTransactionType
+  // Idempotency key for money movement: a retried webhook cannot post twice.
+  reference   String                @unique
+  description String?
+  metadata    Json?
+
+  entries LedgerEntry[]
+
+  createdAt DateTime @default(now())
+
+  @@index([type, createdAt])
+}
+
+model LedgerEntry {
+  id            String            @id @default(uuid())
+  transactionId String
+  transaction   LedgerTransaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  accountId String
+  account   Account @relation(fields: [accountId], references: [id])
+
+  // Signed pesewas: positive debits, negative credits. Sum per transaction = 0.
+  amount Int
+
+  // Optional provenance, for reconciliation queries.
+  raffleId  String?
+  raffle    Raffle?  @relation(fields: [raffleId], references: [id])
+  paymentId String?
+  payment   Payment? @relation(fields: [paymentId], references: [id])
+  orderId   String?
+  order     Order?   @relation(fields: [orderId], references: [id])
+  payoutId  String?
+  payout    Payout?  @relation(fields: [payoutId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([accountId, createdAt])
+  @@index([transactionId])
+  @@index([raffleId])
+}
+
+// ---------------------------------------------------------------------------
+// Audit
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id          String  @id @default(uuid())
+  actorUserId String?
+  actor       User?   @relation(fields: [actorUserId], references: [id])
+
+  action     String // e.g. "raffle.draw", "payout.release"
+  entityType String
+  entityId   String
+  metadata   Json?
+
+  ip        String?
+  userAgent String?
+
+  createdAt DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([actorUserId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Background jobs
+// ---------------------------------------------------------------------------
+// A Postgres-backed queue rather than Redis, for one decisive reason: a job
+// can be enqueued inside the SAME transaction that changes domain state. So
+// "raffle marked expired" and "refund scheduled" either both commit or neither
+// does. With an external queue there is always a window where the database
+// commits and the enqueue fails, and the refund silently never happens.
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+model Job {
+  id      String @id @default(uuid())
+  type    String
+  payload Json?
+
+  // Stops the same logical job being queued twice while one is still
+  // outstanding. Cleared when the job reaches a terminal state, so a later
+  // legitimate re-run of the same work is not blocked forever.
+  //
+  // NOTE: this unique index intentionally keeps Postgres' default NULLS
+  // DISTINCT behaviour -- most jobs carry no dedupe key and many NULLs must
+  // coexist. That is the opposite of Account.type_userId, which needed
+  // NULLS NOT DISTINCT. Do not "fix" one to match the other.
+  dedupeKey String? @unique
+
+  status      JobStatus @default(PENDING)
+  runAt       DateTime  @default(now())
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5)
+  lastError   String?
+
+  // Set while a worker holds the job. A row stuck in RUNNING past a threshold
+  // means the worker died, and is reclaimed.
+  lockedAt DateTime?
+  lockedBy String?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  completedAt DateTime?
+
+  @@index([status, runAt])
+  @@index([type, status])
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+// A durable record of every notification, existing primarily for dedupe.
+//
+// The Job table's dedupeKey is cleared when a job completes, so it can only
+// stop a duplicate while one is still outstanding. "This person has already
+// been told they won" has to be permanent, which is what the unique index
+// below provides. Without it, a replayed webhook or a re-run job would email
+// someone twice.
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+model Notification {
+  id String @id @default(uuid())
+
+  type            String
+  recipientUserId String
+  recipient       User   @relation(fields: [recipientUserId], references: [id], onDelete: Cascade)
+
+  // What the notification is about, so dedupe is scoped to one event.
+  entityType String
+  entityId   String
+
+  status        NotificationStatus @default(PENDING)
+  attempts      Int                @default(0)
+  sentAt        DateTime?
+  failureReason String?
+  // Rendering inputs captured at queue time, so a retry sends the same
+  // message even if the underlying rows have since changed.
+  payload       Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([type, entityId, recipientUserId])
+  @@index([status, createdAt])
+  @@index([recipientUserId, createdAt])
+}

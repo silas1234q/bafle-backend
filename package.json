@@ -1,0 +1,50 @@
+{
+  "name": "backend",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
+    "jobs:tick": "tsx scripts/tick.mts",
+    "email:test": "tsx scripts/email-test.mts",
+    "moolre:callback": "tsx scripts/moolre-callback.mts",
+    "moolre:e2e": "tsx scripts/moolre-e2e.mts",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:studio": "prisma studio",
+    "postinstall": "prisma generate",
+    "test": "tsx tests/payments.test.mts && tsx tests/raffle.test.mts && tsx tests/fulfilment.test.mts && tsx tests/jobs.test.mts && tsx tests/security.test.mts && tsx tests/notifications.test.mts",
+    "test:payments": "tsx tests/payments.test.mts",
+    "test:raffle": "tsx tests/raffle.test.mts",
+    "test:fulfilment": "tsx tests/fulfilment.test.mts",
+    "test:jobs": "tsx tests/jobs.test.mts",
+    "test:security": "tsx tests/security.test.mts",
+    "test:notifications": "tsx tests/notifications.test.mts"
+  },
+  "dependencies": {
+    "@clerk/express": "^2.1.88",
+    "@prisma/adapter-pg": "^7.10.1",
+    "@prisma/client": "^7.10.1",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.10",
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.4",
+    "helmet": "^8.3.0",
+    "nodemailer": "^10.5.0",
+    "pg": "^8.23.1",
+    "svix": "^2.10.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
+    "prisma": "^7.10.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

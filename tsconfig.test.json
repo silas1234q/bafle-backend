@@ -1,0 +1,13 @@
+{
+  "//": "Typechecks tests alongside src. Separate from tsconfig.json because tests live outside rootDir and must never be emitted into dist.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true
+  },
+  "include": [
+    "src/**/*.ts",
+    "tests/**/*.mts",
+    "scripts/**/*.mts"
+  ]
+}
