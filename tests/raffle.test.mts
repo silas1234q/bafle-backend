@@ -681,12 +681,21 @@ try {
     "the refused edit changed nothing",
   );
 
+  // A different refusal from the edit above, deliberately: this raffle is
+  // DRAWN, so a winner is waiting on delivery. Withdrawal reopens once the
+  // sale settles — fulfilment section 16 covers that, against a raffle that
+  // reached COMPLETED through the real escrow release.
   const frozenDelete = await archiveProduct(product.id, seller.id)
     .then(() => null)
     .catch((e: unknown) => e);
   check(
-    frozenDelete instanceof ProductMutationError && frozenDelete.code === "TICKETS_SOLD",
-    "deleting a listing with paid tickets is refused",
+    frozenDelete instanceof ProductMutationError &&
+      frozenDelete.code === "SALE_IN_PROGRESS",
+    `deleting a listing mid-sale is refused -> ${
+      frozenDelete instanceof ProductMutationError
+        ? frozenDelete.code
+        : String(frozenDelete)
+    }`,
   );
   check(
     (await prisma.product.findUniqueOrThrow({

@@ -9,22 +9,34 @@ type Tx = Prisma.TransactionClient;
 /**
  * Seller edits and removal of their own listing.
  *
- * One rule governs both: **a paid ticket freezes the listing.** From the moment
- * any buyer's money is in, the seller can neither change what they are selling
- * nor withdraw it. Without that, two things are possible that the rest of the
- * system has no answer for — selling tickets for one item and editing the
- * listing into another, and a seller cancelling a raffle because sales are
- * going badly, which would have to refund buyers who were owed a draw.
+ * A paid ticket freezes the listing, but **the two freezes do not lift
+ * together**, because they protect different things:
+ *
+ * - **Editing** closes for good at the first paid ticket. The listing is the
+ *   record of what those buyers paid for, and their tickets and the order read
+ *   through it. Selling tickets for one item and then editing the listing into
+ *   another is the attack this closes.
+ * - **Withdrawal** closes only while the sale still owes somebody something: a
+ *   winner, a delivery, or a refund. Once it is finished — COMPLETED, meaning
+ *   delivered, confirmed and the seller's escrow released — the seller may
+ *   take the listing off their shelf. Refusing that was never a safety
+ *   property, only the paid-ticket check being coarser than the thing it
+ *   protects: a seller who had sold and shipped an item could never clear it
+ *   from `/sell`.
  *
  * Removal is an ARCHIVE, never a row delete: Raffle and Order hold foreign
  * keys to Product, so deleting the row would either fail or orphan a completed
- * sale's history.
+ * sale's history. That is also what makes withdrawing a finished sale safe —
+ * nothing in the order, payout, refund or ticket-history paths reads
+ * `Product.status`, so archiving disturbs neither a payout still in flight nor
+ * the winner's own record of what they won.
  */
 
 export class ProductMutationError extends Error {
   readonly code:
     | "NOT_FOUND"
     | "TICKETS_SOLD"
+    | "SALE_IN_PROGRESS"
     | "CHECKOUT_IN_PROGRESS"
     | "BREAKS_PRICING_FLOOR";
 
@@ -45,6 +57,25 @@ const LIVE_RAFFLE_STATES = [
   "REFUNDING",
 ] as const;
 
+/**
+ * Raffle states in which a paid ticket no longer owes anybody anything.
+ *
+ * COMPLETED is the one that matters: the winner has confirmed the handover and
+ * escrow has been released, so every ticket holder has had what they bought —
+ * a chance at the item — and the seller has been paid.
+ *
+ * REFUNDED is belt-and-braces. `settleRefund` flips each refunded ticket out
+ * of PAID, so a fully refunded raffle has no paid tickets left to count; it is
+ * listed so the rule reads as "settled", not "settled, plus a coincidence".
+ *
+ * **CANCELLED is deliberately absent, even though the database counts it as
+ * terminal** (`Raffle_one_live_per_product`). A cancelled raffle whose refunds
+ * are `blocked` — Moolre has no payer on file, so a human has to pay someone
+ * back by hand — keeps its tickets PAID. Treating it as settled would let the
+ * seller withdraw the listing while real buyers are still owed money.
+ */
+const SETTLED_RAFFLE_STATES = ["COMPLETED", "REFUNDED"] as const;
+
 export interface EditableProduct {
   title?: string;
   description?: string;
@@ -56,17 +87,37 @@ export interface EditableProduct {
 }
 
 /**
- * Throws unless the seller may still change or withdraw this listing.
+ * Throws if somebody may be on the provider's checkout page right now.
+ *
+ * Their payment would land against a listing that no longer says what they
+ * bought, so both edits and withdrawal wait rather than racing it. Unlike the
+ * paid-ticket refusals this one clears on its own once the reservation sweep
+ * collects the hold, which is why it reads as a separate code.
+ */
+async function assertNoCheckoutInFlight(
+  tx: Tx,
+  productId: string,
+): Promise<void> {
+  const pending = await tx.payment.count({
+    where: { raffle: { productId }, status: "PENDING" },
+  });
+
+  if (pending > 0) {
+    throw new ProductMutationError(
+      "CHECKOUT_IN_PROGRESS",
+      "Someone is part-way through paying for a ticket. Try again in a few minutes.",
+    );
+  }
+}
+
+/**
+ * Throws unless the seller may still change what this listing says.
  *
  * Takes the caller's transaction, so the decision and the write that depends
  * on it commit together — checking outside the transaction would leave a
  * window where a reservation lands between the two.
- *
- * Two distinct refusals, because they mean different things to the person
- * reading them: TICKETS_SOLD is permanent and CHECKOUT_IN_PROGRESS clears on
- * its own once the reservation sweep runs.
  */
-async function assertNotFrozen(tx: Tx, productId: string): Promise<void> {
+async function assertEditable(tx: Tx, productId: string): Promise<void> {
   // A PAID ticket on any raffle of this product, past or present. Checked
   // against Ticket rather than Raffle.ticketsSold, which is only a display
   // counter — the tickets themselves are the money.
@@ -78,23 +129,40 @@ async function assertNotFrozen(tx: Tx, productId: string): Promise<void> {
     throw new ProductMutationError(
       "TICKETS_SOLD",
       `${paid} ticket${paid === 1 ? " has" : "s have"} been paid for. ` +
-        `A listing cannot be changed or removed once buyers have entered.`,
+        `A listing cannot be changed once buyers have entered.`,
     );
   }
 
-  // Someone may be on the provider's checkout page right now. Their payment
-  // would land against a listing that no longer says what they bought, so
-  // this waits rather than racing it.
-  const pending = await tx.payment.count({
-    where: { raffle: { productId }, status: "PENDING" },
+  await assertNoCheckoutInFlight(tx, productId);
+}
+
+/**
+ * Throws unless the seller may take this listing off their shelf.
+ *
+ * Same transaction discipline as `assertEditable`, but a narrower question:
+ * not "has money ever been in" but "is anybody still owed something". A paid
+ * ticket on a raffle that has not settled means a winner, a delivery or a
+ * refund is outstanding, and withdrawing the listing would either strand that
+ * obligation or let a seller cancel a sale that is going badly.
+ */
+async function assertWithdrawable(tx: Tx, productId: string): Promise<void> {
+  const outstanding = await tx.ticket.count({
+    where: {
+      raffle: { productId, status: { notIn: [...SETTLED_RAFFLE_STATES] } },
+      status: "PAID",
+    },
   });
 
-  if (pending > 0) {
+  if (outstanding > 0) {
     throw new ProductMutationError(
-      "CHECKOUT_IN_PROGRESS",
-      "Someone is part-way through paying for a ticket. Try again in a few minutes.",
+      "SALE_IN_PROGRESS",
+      `${outstanding} ticket${outstanding === 1 ? " has" : "s have"} been paid for ` +
+        `and this sale is not finished. You can remove the listing once the winner ` +
+        `has confirmed delivery, or once every ticket has been refunded.`,
     );
   }
+
+  await assertNoCheckoutInFlight(tx, productId);
 }
 
 /**
@@ -157,7 +225,7 @@ export async function updateProduct(
   if (input.retailValue !== undefined) data.retailValue = input.retailValue;
 
   await prisma.$transaction(async (tx) => {
-    await assertNotFrozen(tx, productId);
+    await assertEditable(tx, productId);
 
     if (input.images) {
       // Replace rather than merge: the form sends the gallery it wants, and
@@ -186,6 +254,10 @@ export async function updateProduct(
  * deleted. CANCELLED is also outside the `Raffle_one_live_per_product` partial
  * index, so the row stops blocking the product's slot.
  *
+ * A finished sale is withdrawn without cancelling anything: a COMPLETED raffle
+ * is not in LIVE_RAFFLE_STATES, so its paid tickets, its order and its payout
+ * are left exactly as they are and only the product leaves the seller's list.
+ *
  * Idempotent: archiving an archived product is a no-op, so a double-tap on the
  * confirm button is not an error.
  */
@@ -207,7 +279,7 @@ export async function archiveProduct(
   }
 
   const liveIds = await prisma.$transaction(async (tx) => {
-    await assertNotFrozen(tx, productId);
+    await assertWithdrawable(tx, productId);
 
     const live = await tx.raffle.findMany({
       where: { productId, status: { in: [...LIVE_RAFFLE_STATES] } },
@@ -225,9 +297,12 @@ export async function archiveProduct(
         data: { status: "CANCELLED", ticketsSold: 0 },
       });
 
-      // Every reservation left is unpaid and unpayable — assertNotFrozen has
-      // ruled out PAID tickets and PENDING payments, so these are lapsed
-      // holds the sweep had not reached yet. Deleted rather than VOIDed,
+      // Every ticket left on these raffles is unpaid and unpayable:
+      // `assertWithdrawable` has ruled out PAID tickets on any unsettled
+      // raffle and LIVE_RAFFLE_STATES is entirely unsettled, so nothing here
+      // can be a paid ticket — these are lapsed holds the sweep had not
+      // reached yet. A COMPLETED raffle's paid tickets are untouched, because
+      // a settled raffle never enters `ids`. Deleted rather than VOIDed,
       // matching releaseExpiredReservations.
       await tx.ticket.deleteMany({ where: { raffleId: { in: ids } } });
     }

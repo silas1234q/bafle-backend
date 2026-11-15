@@ -24,6 +24,8 @@ const { accountBalances, totalLedgerSum, raffleEscrowBalance } = await import(
 );
 const orders = await import("../src/services/orders.js");
 const payouts = await import("../src/services/payouts.js");
+const products = await import("../src/services/products.js");
+const { listUserTickets } = await import("../src/services/tickets.js");
 const refunds = await import("../src/services/refunds.js");
 const sellers = await import("../src/services/sellers.js");
 const secrets = await import("../src/lib/payoutSecrets.js");
@@ -836,6 +838,114 @@ try {
     })) === 2,
     "a provider reporting no fee still posts exactly two legs",
   );
+
+  console.log("");
+  console.log("16. A finished sale can be taken off the seller's shelf");
+
+  // The point of putting this here rather than in the raffle suite: `raffle`
+  // reached COMPLETED through the real `releaseEscrow` in section 4, with a
+  // real order, real paid tickets and a real payout behind it. Until now a
+  // paid ticket froze the listing forever, so a seller who had sold, shipped
+  // and been paid could never clear the item out of `/sell`.
+
+  // Editing is still refused, and that asymmetry is the whole design: the
+  // listing is the record of what those two buyers paid for. Asserted before
+  // the archive, since an archived product reads as NOT_FOUND to an edit.
+  const soldEdit = await products
+    .updateProduct(product.id, { title: "Something else entirely" })
+    .then(() => null)
+    .catch((e: unknown) => e);
+  check(
+    soldEdit instanceof products.ProductMutationError &&
+      soldEdit.code === "TICKETS_SOLD",
+    `a completed sale still cannot be edited -> ${
+      soldEdit instanceof products.ProductMutationError ? soldEdit.code : String(soldEdit)
+    }`,
+  );
+
+  // The disputed sale from section 9 is the counter-case: its raffle is still
+  // DRAWN, so somebody is owed either the item or their money.
+  const disputedWithdraw = await products
+    .archiveProduct(p2.id, s2.id)
+    .then(() => null)
+    .catch((e: unknown) => e);
+  check(
+    disputedWithdraw instanceof products.ProductMutationError &&
+      disputedWithdraw.code === "SALE_IN_PROGRESS",
+    `an unfinished sale still refuses withdrawal -> ${
+      disputedWithdraw instanceof products.ProductMutationError
+        ? disputedWithdraw.code
+        : String(disputedWithdraw)
+    }`,
+  );
+  check(
+    (await prisma.product.findUniqueOrThrow({
+      where: { id: p2.id },
+      select: { status: true },
+    })).status !== "ARCHIVED",
+    "the refused withdrawal left that listing alone",
+  );
+
+  const soldWithdraw = await products.archiveProduct(product.id, seller.id);
+  check(!soldWithdraw.alreadyArchived, "the completed listing was withdrawn");
+  check(
+    soldWithdraw.cancelledRaffleIds.length === 0,
+    `nothing was cancelled on the way out -> ${soldWithdraw.cancelledRaffleIds.length}`,
+  );
+  check(
+    (await prisma.product.findUniqueOrThrow({
+      where: { id: product.id },
+      select: { status: true },
+    })).status === "ARCHIVED",
+    "the product is ARCHIVED, not deleted",
+  );
+
+  // Everything the sale consists of has to survive untouched. An archive that
+  // quietly cancelled the raffle or dropped its tickets would rewrite history
+  // a buyer and a payout both still read through.
+  check(
+    (await prisma.raffle.findUniqueOrThrow({
+      where: { id: raffle.id },
+      select: { status: true },
+    })).status === "COMPLETED",
+    "its raffle is still COMPLETED",
+  );
+  check(
+    (await prisma.ticket.count({ where: { raffleId: raffle.id, status: "PAID" } })) === POOL,
+    `the paid tickets are still there -> ${await prisma.ticket.count({
+      where: { raffleId: raffle.id, status: "PAID" },
+    })}`,
+  );
+  check(
+    (await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+      select: { status: true },
+    })).status === "CONFIRMED",
+    "the order is still CONFIRMED",
+  );
+  check(
+    (await prisma.payout.count({ where: { orderId: order.id } })) === 1,
+    "the payout row survives, so the money is still accounted for",
+  );
+  check((await totalLedgerSum()) === 0, "the ledger is untouched by a withdrawal");
+
+  // The winner's own record of what they won must not disappear because the
+  // seller tidied their shelf. `listUserTickets` roots on Raffle and never
+  // reads Product.status, which is what makes this hold.
+  const winnerHistory = await listUserTickets(winnerId);
+  check(
+    winnerHistory.entries.some((e) => e.raffle.id === raffle.id),
+    "the winner's ticket history still shows the raffle",
+  );
+
+  // Mirrors the `where` in GET /products/mine, which this suite cannot call
+  // without a Clerk session.
+  check(
+    (await prisma.product.count({
+      where: { id: product.id, sellerId: seller.id, status: { not: "ARCHIVED" } },
+    })) === 0,
+    "and it has left the seller's listings",
+  );
 } catch (suiteError) {
   // Without this the finally block's process.exit discards the exception and
   // the run looks like a clean pass that simply stopped early.
@@ -857,6 +967,13 @@ try {
     where: { order: { raffleId: { in: rIds } } },
   });
   await prisma.ledgerTransaction.deleteMany({ where: { entries: { none: {} } } });
+  // Audit rows are keyed by the entity they describe, which for escrow
+  // release and delivery is the ORDER, not the raffle. Resolved here, while
+  // the orders still exist — reading them after the delete below returned an
+  // empty list every run, so those rows were never actually cleared.
+  const auditOrderIds = (
+    await prisma.order.findMany({ where: { raffleId: { in: rIds } }, select: { id: true } })
+  ).map((o) => o.id);
   await prisma.payout.deleteMany({ where: { order: { raffleId: { in: rIds } } } });
   await prisma.dispute.deleteMany({ where: { order: { raffleId: { in: rIds } } } });
   await prisma.order.deleteMany({ where: { raffleId: { in: rIds } } });
@@ -866,12 +983,6 @@ try {
   await prisma.payment.deleteMany({ where: { raffleId: { in: rIds } } });
   await prisma.raffle.deleteMany({ where: { id: { in: rIds } } });
   await prisma.product.deleteMany({ where: { id: { in: made.products } } });
-  // Audit rows are keyed by the entity they describe, which for escrow
-  // release and delivery is the ORDER, not the raffle. Deleting only by
-  // raffle id left rows behind that another suite then tripped over.
-  const auditOrderIds = (
-    await prisma.order.findMany({ where: { raffleId: { in: rIds } }, select: { id: true } })
-  ).map((o) => o.id);
   await prisma.auditLog.deleteMany({
     where: { entityId: { in: [...rIds, ...auditOrderIds, ...made.users] } },
   });

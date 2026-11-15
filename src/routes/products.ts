@@ -86,8 +86,8 @@ productsRouter.get("/", async (req, res) => {
  * `GET /` only ever returns ACTIVE products, so without this a seller cannot
  * see the draft they just created or find out why one was rejected. Unlike the
  * public projection this includes `moderationNotes` — the rejection reason is
- * precisely what the seller needs — and the live raffle, so the UI can tell
- * "ready to raffle" apart from "already running".
+ * precisely what the seller needs — and the latest raffle, so the UI can tell
+ * "ready to raffle" from "already running" from "sold and done with".
  *
  * MUST stay above `/:id`, or Express matches "mine" as a product id.
  */
@@ -103,10 +103,21 @@ productsRouter.get("/mine", requireUser, async (req, res) => {
       ...publicProductFields,
       moderationNotes: true,
       reviewedAt: true,
-      // A product carries at most one unfinished raffle (enforced by the
-      // partial unique index), so this is a list of zero or one.
+      // Every raffle this product has had, newest first — not just the
+      // unfinished one, and not just the newest.
+      //
+      // Both halves are load-bearing for the seller's controls, and the real
+      // case that forced it is a product with a COMPLETED sale *and* a fresh
+      // OPEN raffle (the item sold, the seller listed another one). The newest
+      // raffle drives the progress meter and the prompts; the finished ones
+      // decide whether money has ever been in, which is what the edit freeze
+      // turns on. With only the newest, the page offers an Edit the API then
+      // refuses — and with only the unfinished one, as before, it offered a
+      // Delete the API refused.
+      //
+      // The partial unique index allows at most one unfinished raffle, so the
+      // newest is the live one whenever one is live.
       raffles: {
-        where: { status: { in: ["OPEN", "SOLD_OUT", "DRAWN"] } },
         select: {
           id: true,
           status: true,
@@ -115,7 +126,12 @@ productsRouter.get("/mine", requireUser, async (req, res) => {
           ticketsSold: true,
           closesAt: true,
         },
-        take: 1,
+        orderBy: { createdAt: "desc" },
+        // A bound, because this is a nested list inside a list of 100. Ten
+        // relistings is already far more than any real product has, and the
+        // only cost of truncation is a stale button: the service re-checks
+        // every raffle and refuses with a message that says why.
+        take: 10,
       },
     },
     orderBy: { createdAt: "desc" },
@@ -226,6 +242,7 @@ const updateProductSchema = createProductSchema.partial().refine(
 const MUTATION_STATUS: Record<ProductMutationError["code"], number> = {
   NOT_FOUND: 404,
   TICKETS_SOLD: 409,
+  SALE_IN_PROGRESS: 409,
   CHECKOUT_IN_PROGRESS: 409,
   BREAKS_PRICING_FLOOR: 409,
 };
@@ -298,6 +315,10 @@ productsRouter.patch("/:id", requireUser, contentLimiter, async (req, res) => {
  * completed sale's history has to survive. Any raffle that nobody has paid
  * into is cancelled along with it, because `GET /raffles` filters on raffle
  * status alone and would otherwise keep selling tickets for this listing.
+ *
+ * Refused with SALE_IN_PROGRESS while paid tickets are outstanding, but
+ * allowed once the sale has finished — see `services/products.ts` for why that
+ * is narrower than the edit freeze.
  */
 productsRouter.delete("/:id", requireUser, async (req, res) => {
   const user = localUser(req);
