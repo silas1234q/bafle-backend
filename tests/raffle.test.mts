@@ -20,6 +20,7 @@ const { prisma } = await import("../src/lib/prisma.js");
 const { createRaffle, extendRaffle, RaffleExtendError, RaffleValidationError } =
   await import("../src/services/raffles.js");
 const {
+  abandonReservation,
   reserveTickets,
   TicketPurchaseError,
   releaseExpiredReservations,
@@ -27,6 +28,7 @@ const {
 } = await import(
   "../src/services/tickets.js"
 );
+const { raffleAvailability } = await import("../src/services/raffles.js");
 const { executeDraw, notifyDrawScheduled } = await import("../src/services/draw.js");
 const { DRAW_DELAY_MS } = await import("../src/services/payments.js");
 const { runSweeps } = await import("../src/jobs/handlers.js");
@@ -933,6 +935,104 @@ try {
     where: { id: lateRaffleId },
     data: { status: "OPEN" },
   });
+
+  console.log("\n17. Giving up a hold puts the numbers back immediately");
+
+  const cancelSeller = await makeUser("cancelseller");
+  const cancelProduct = await makeProduct(cancelSeller.id, 20_000);
+  const cancelRaffle = await createRaffle({
+    productId: cancelProduct.id,
+    sellerId: cancelSeller.id,
+    ticketPriceMinor: 2_000,
+    totalTickets: 10,
+    closesAt: new Date(Date.now() + 7 * 86_400_000),
+  });
+  made.raffles.push(cancelRaffle.id);
+
+  const quitter = await makeUser("quitter");
+  const cancelHold = await reserveTickets({
+    raffleId: cancelRaffle.id,
+    userId: quitter.id,
+    quantity: 4,
+    customerEmail: `quitter.${tag}@test.invalid`,
+  });
+
+  const duringHold = await raffleAvailability(cancelRaffle.id);
+  check(
+    duringHold?.available === 6 && duringHold.held === 4,
+    `a hold takes the numbers off the shelf -> available=${duringHold?.available} held=${duringHold?.held}`,
+  );
+
+  const cancelled = await abandonReservation(cancelHold.reference, quitter.id);
+  check(cancelled.outcome === "released", `cancel -> ${cancelled.outcome}`);
+
+  const afterCancel = await raffleAvailability(cancelRaffle.id);
+  check(
+    afterCancel?.available === 10 && afterCancel.held === 0,
+    `and puts all of them back at once -> available=${afterCancel?.available} held=${afterCancel?.held}`,
+  );
+
+  // The rows survive on purpose. confirmTicketPayment claims RESERVED rows
+  // without checking expiry, so a buyer whose money turns up anyway still
+  // gets their tickets instead of reservation_lost.
+  check(
+    (await prisma.ticket.count({
+      where: { raffleId: cancelRaffle.id, status: "RESERVED" },
+    })) === 4,
+    "the rows are expired, not deleted, so a late payment can still claim them",
+  );
+  check(
+    (await prisma.payment.findUniqueOrThrow({
+      where: { reference: cancelHold.reference },
+      select: { status: true },
+    })).status === "PENDING",
+    "and the payment stays PENDING rather than being pre-emptively abandoned",
+  );
+
+  // Someone else must be able to take the freed numbers straight away.
+  const nextBuyer = await makeUser("nextbuyer");
+  const retaken = await reserveTickets({
+    raffleId: cancelRaffle.id,
+    userId: nextBuyer.id,
+    quantity: 10,
+    customerEmail: `next.${tag}@test.invalid`,
+  });
+  check(
+    retaken.ticketNumbers.length === 10,
+    `another buyer can take the whole pool immediately -> ${retaken.ticketNumbers.length} numbers`,
+  );
+
+  // Ownership and idempotency.
+  try {
+    await abandonReservation(retaken.reference, quitter.id);
+    check(false, "someone else's reference should not be cancellable");
+  } catch (e) {
+    check(
+      e instanceof TicketPurchaseError && e.code === "PAYMENT_NOT_FOUND",
+      `someone else's reference cannot be cancelled -> ${(e as { code?: string }).code}`,
+    );
+  }
+  const twice = await abandonReservation(cancelHold.reference, quitter.id);
+  check(
+    twice.outcome === "nothing_held",
+    `cancelling twice is harmless -> ${twice.outcome}`,
+  );
+
+  // A paid ticket must never be given up by this path.
+  await prisma.payment.update({
+    where: { reference: retaken.reference },
+    data: { status: "SUCCESS" },
+  });
+  const paidCancel = await abandonReservation(retaken.reference, nextBuyer.id);
+  check(
+    paidCancel.outcome === "already_paid" &&
+      (await prisma.ticket.count({
+        where: { paymentId: (await prisma.payment.findUniqueOrThrow({
+          where: { reference: retaken.reference }, select: { id: true },
+        })).id, status: "RESERVED" },
+      })) === 10,
+    `a paid payment keeps its numbers -> ${paidCancel.outcome}`,
+  );
 } catch (suiteError) {
   // Without this the finally block's process.exit discards the exception and
   // the run looks like a clean pass that simply stopped early.

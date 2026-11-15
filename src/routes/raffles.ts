@@ -193,6 +193,10 @@ const PURCHASE_STATUS: Record<TicketPurchaseError["code"], number> = {
   SELLER_CANNOT_ENTER: 403,
   INVALID_QUANTITY: 400,
   CHECKOUT_FAILED: 502,
+  // Unreachable from this router, which never looks a payment up. Present
+  // because the Record is exhaustive on purpose — it is what forces a new
+  // error code to be given a status rather than defaulting to 500.
+  PAYMENT_NOT_FOUND: 404,
 };
 
 // Limiter after requireUser so it keys on the user, not a shared NAT IP.

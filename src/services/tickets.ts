@@ -17,7 +17,8 @@ export class TicketPurchaseError extends Error {
     | "NOT_ENOUGH_TICKETS"
     | "SELLER_CANNOT_ENTER"
     | "INVALID_QUANTITY"
-    | "CHECKOUT_FAILED";
+    | "CHECKOUT_FAILED"
+    | "PAYMENT_NOT_FOUND";
   readonly available?: number;
 
   constructor(
@@ -43,6 +44,62 @@ const RESERVATION_TTL_MS = 15 * 60_000;
  * their numbers would be permanently unusable and a raffle could never reach
  * sold out. The audit trail survives on the Payment row.
  */
+/**
+ * Gives up a hold the buyer no longer wants, immediately.
+ *
+ * The problem this solves: a reservation is held for RESERVATION_TTL_MS so a
+ * buyer can pay without losing their numbers, and availability counts it the
+ * whole time. A buyer who opens checkout and backs out therefore keeps those
+ * numbers off the shelf for fifteen minutes — on a small raffle that can read
+ * as nearly sold out, and they cannot re-buy their own numbers either.
+ *
+ * **It expires the hold rather than deleting it, and that difference is the
+ * whole design.** Availability filters on `reservationExpiresAt > now`, so
+ * moving that to the present frees the numbers on the very next read. But
+ * `confirmTicketPayment` deliberately claims RESERVED rows *without*
+ * checking expiry — so if this buyer turns out to have paid after all (a
+ * mobile money prompt already in flight, a webhook still in the post), the
+ * rows are still there to be claimed and the payment settles normally.
+ *
+ * Deleting instead would make that case fail every single time:
+ * `confirmTicketPayment` would find zero rows, roll back, and record
+ * `reservation_lost` — money taken, no ticket, a human to chase. Expiring in
+ * place narrows that to the genuine race where somebody else claims the same
+ * number in the meantime, which is the identical risk natural expiry already
+ * carries.
+ *
+ * The Payment is left PENDING for the same reason. The sweep marks it
+ * ABANDONED when it collects the row, by which point the numbers really are
+ * gone.
+ */
+export async function abandonReservation(
+  reference: string,
+  userId: string,
+): Promise<{ outcome: "released" | "already_paid" | "nothing_held" }> {
+  const payment = await prisma.payment.findUnique({
+    where: { reference },
+    select: { id: true, userId: true, status: true },
+  });
+
+  // Same response whether it is missing or someone else's, so this cannot be
+  // used to probe for other people's references.
+  if (!payment || payment.userId !== userId) {
+    throw new TicketPurchaseError("PAYMENT_NOT_FOUND", "Payment not found");
+  }
+
+  // Never touch a payment that already went through. A buyer hitting "cancel"
+  // after a successful charge must keep the tickets they paid for.
+  if (payment.status === "SUCCESS") return { outcome: "already_paid" };
+  if (payment.status !== "PENDING") return { outcome: "nothing_held" };
+
+  const released = await prisma.ticket.updateMany({
+    where: { paymentId: payment.id, status: "RESERVED" },
+    data: { reservationExpiresAt: new Date() },
+  });
+
+  return { outcome: released.count > 0 ? "released" : "nothing_held" };
+}
+
 export async function releaseExpiredReservations(
   raffleId?: string,
 ): Promise<number> {
@@ -319,6 +376,8 @@ async function startCheckout(
       currency: "GHS",
       customerEmail: input.customerEmail,
       callbackUrl: env.PAYSTACK_CALLBACK_URL ?? undefined,
+      // Tied to the hold, so the link cannot outlive the numbers it is for.
+      expiresAt: reserved.reservationExpiresAt,
       metadata: {
         raffleId,
         paymentId: reserved.paymentId,

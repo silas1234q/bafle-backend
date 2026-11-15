@@ -424,6 +424,17 @@ export class MoolreProvider implements PaymentProvider {
         // that only ever reserved one set of numbers. Required by the API,
         // and the unsafe value is the one that looks harmless.
         reusable: "0",
+        // Minutes, minimum 1 — the unit the API wants. Rounded UP so the link
+        // never dies a few seconds before the hold it belongs to, which would
+        // strand a buyer who was about to pay.
+        ...(request.expiresAt
+          ? {
+              expiration_time: Math.max(
+                1,
+                Math.ceil((request.expiresAt.getTime() - Date.now()) / 60_000),
+              ),
+            }
+          : {}),
         // `redirect` is where the BUYER lands after paying (our /paid page).
         // The server-to-server callback is deliberately not set here: Moolre
         // ties the callback secret to the wallet's own callback URL, set once

@@ -37,6 +37,15 @@ export interface CheckoutRequest {
   customerEmail: string;
   /** Where the provider returns the buyer after payment. */
   callbackUrl?: string;
+  /**
+   * When this checkout stops being payable.
+   *
+   * Should track the reservation it belongs to. A link that outlives its hold
+   * can take money for numbers that have already been released, and the buyer
+   * gets `reservation_lost` — a real charge with no ticket and a human to
+   * chase. Expressed as a moment; drivers convert to whatever unit they want.
+   */
+  expiresAt?: Date;
   metadata?: Record<string, unknown>;
 }
 

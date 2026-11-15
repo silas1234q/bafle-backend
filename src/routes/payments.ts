@@ -4,6 +4,7 @@ import { param } from "../lib/http.js";
 import { localUser, requireUser } from "../middleware/auth.js";
 import { prisma } from "../lib/prisma.js";
 import { settleTicketPayment } from "../services/payments.js";
+import { abandonReservation, TicketPurchaseError } from "../services/tickets.js";
 
 export const paymentsRouter = Router();
 
@@ -27,6 +28,37 @@ paymentsRouter.use(requireUser);
  * session, and the amount is re-read from the provider inside
  * `confirmTicketPayment`.
  */
+/**
+ * Gives up the numbers a buyer reserved but decided not to pay for.
+ *
+ * Without it those numbers sit off the shelf for the full reservation window,
+ * which on a small raffle reads as nearly sold out and blocks the buyer from
+ * re-buying their own numbers.
+ *
+ * Idempotent, and deliberately forgiving: cancelling something already paid
+ * for, already released, or never held all answer 200 with what actually
+ * happened. A cancel button that can fail is a cancel button people press
+ * twice.
+ */
+paymentsRouter.post("/:reference/cancel", async (req, res) => {
+  const user = localUser(req);
+  const reference = param(req, "reference");
+
+  try {
+    const result = await abandonReservation(reference, user.id);
+    res.json(result);
+  } catch (error) {
+    if (
+      error instanceof TicketPurchaseError &&
+      error.code === "PAYMENT_NOT_FOUND"
+    ) {
+      res.status(404).json({ error: "Payment not found" });
+      return;
+    }
+    throw error;
+  }
+});
+
 paymentsRouter.post("/:reference/verify", async (req, res) => {
   const user = localUser(req);
   const reference = param(req, "reference");
