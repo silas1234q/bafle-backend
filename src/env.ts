@@ -278,6 +278,22 @@ if (IS_PRODUCTION) {
     );
   }
 
+  // Where the provider sends a buyer back after paying. Unset means the
+  // provider gets no return URL at all; localhost means it sends paying
+  // customers to their own machine. Either way the buyer never reaches /paid,
+  // so their payment is never confirmed from the browser and their reserved
+  // numbers are never released when they back out — both silent, and both
+  // only visible as "people paid and got nothing".
+  if (!process.env.PAYSTACK_CALLBACK_URL) {
+    problems.push(
+      "PAYSTACK_CALLBACK_URL must be set in production; without it buyers are never returned to the site after paying",
+    );
+  } else if (/localhost|127.0.0.1/.test(process.env.PAYSTACK_CALLBACK_URL)) {
+    problems.push(
+      "PAYSTACK_CALLBACK_URL points at localhost but NODE_ENV=production; every paying buyer would be redirected to their own machine",
+    );
+  }
+
   for (const key of [
     "CLOUDINARY_CLOUD_NAME",
     "CLOUDINARY_API_KEY",

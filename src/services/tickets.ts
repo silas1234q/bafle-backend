@@ -10,6 +10,34 @@ import { PUBLIC_RAFFLE_FIELDS, raffleAvailability } from "./raffles.js";
 import { paymentProvider } from "../payments/index.js";
 import { PaymentProviderError } from "../payments/provider.js";
 
+/**
+ * Where the provider sends the buyer back, with our reference already on it.
+ *
+ * Appended by us rather than relied on from the provider, because they differ:
+ * Paystack adds `?reference=` (and sometimes `trxref=`), Moolre documents no
+ * appended parameters at all for a hosted link's `redirect`. Without the
+ * reference the return page has nothing to look up — it cannot confirm the
+ * payment and it cannot release the hold, so a buyer who cancels keeps their
+ * numbers off the shelf for the full window.
+ *
+ * Harmless where the provider also appends its own: the page reads the first
+ * `reference` it finds, and both carry the same value.
+ */
+function buyerReturnUrl(reference: string): string | undefined {
+  const base = env.PAYSTACK_CALLBACK_URL;
+  if (!base) return undefined;
+
+  try {
+    const url = new URL(base);
+    url.searchParams.set("reference", reference);
+    return url.toString();
+  } catch {
+    // A malformed callback URL must not take the whole purchase down; the
+    // provider simply gets none and the buyer verifies from /tickets instead.
+    return undefined;
+  }
+}
+
 export class TicketPurchaseError extends Error {
   readonly code:
     | "RAFFLE_NOT_FOUND"
@@ -375,7 +403,7 @@ async function startCheckout(
       amountMinor,
       currency: "GHS",
       customerEmail: input.customerEmail,
-      callbackUrl: env.PAYSTACK_CALLBACK_URL ?? undefined,
+      callbackUrl: buyerReturnUrl(reference),
       // Tied to the hold, so the link cannot outlive the numbers it is for.
       expiresAt: reserved.reservationExpiresAt,
       metadata: {
