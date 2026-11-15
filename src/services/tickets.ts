@@ -2,6 +2,7 @@ import { env } from "../env.js";
 import { newReference } from "../lib/reference.js";
 import type {
   PaymentStatus,
+  Prisma,
   RaffleStatus,
   TicketStatus,
 } from "../generated/prisma/client.js";
@@ -129,23 +130,25 @@ export async function abandonReservation(
 }
 
 export async function releaseExpiredReservations(
-  raffleId?: string,
+  scope: { raffleId?: string; productId?: string } = {},
+  tx?: Prisma.TransactionClient,
 ): Promise<number> {
   const now = new Date();
 
-  return prisma.$transaction(async (tx) => {
-    const expired = await tx.ticket.findMany({
+  const run = async (client: Prisma.TransactionClient) => {
+    const expired = await client.ticket.findMany({
       where: {
         status: "RESERVED",
         reservationExpiresAt: { lt: now },
-        ...(raffleId ? { raffleId } : {}),
+        ...(scope.raffleId ? { raffleId: scope.raffleId } : {}),
+        ...(scope.productId ? { raffle: { productId: scope.productId } } : {}),
       },
       select: { id: true, paymentId: true },
     });
 
     if (expired.length === 0) return 0;
 
-    await tx.ticket.deleteMany({
+    await client.ticket.deleteMany({
       where: { id: { in: expired.map((ticket) => ticket.id) } },
     });
 
@@ -160,14 +163,20 @@ export async function releaseExpiredReservations(
     if (paymentIds.length > 0) {
       // Only PENDING: a payment that already succeeded must never be
       // downgraded, even if some ticket row looked stale.
-      await tx.payment.updateMany({
+      await client.payment.updateMany({
         where: { id: { in: paymentIds }, status: "PENDING" },
         data: { status: "ABANDONED", failureReason: "reservation_expired" },
       });
     }
 
     return expired.length;
-  });
+  };
+
+  // The optional caller transaction exists for the product mutations: they
+  // clear a listing's lapsed holds in the same transaction as the check that
+  // depends on them, so the delete-tickets/abandon-payment pair commits with
+  // the edit it unblocks (or not at all).
+  return tx ? run(tx) : prisma.$transaction(run);
 }
 
 export interface ReserveTicketsInput {
@@ -223,7 +232,7 @@ export async function reserveTickets(
     );
   }
 
-  await releaseExpiredReservations(raffleId);
+  await releaseExpiredReservations({ raffleId });
 
   // Cheap pre-checks. None of these can change under us in a way that matters:
   // a raffle does not change owner, and the closing race is caught again

@@ -466,7 +466,7 @@ try {
     where: { raffleId: raffle2.id, status: "RESERVED" },
     data: { reservationExpiresAt: new Date(Date.now() - 1000) },
   });
-  const released = await releaseExpiredReservations(raffle2.id);
+  const released = await releaseExpiredReservations({ raffleId: raffle2.id });
   check(released === 2, `releaseExpiredReservations freed ${released} tickets`);
   check(
     (await prisma.payment.findUniqueOrThrow({ where: { reference: held.reference } })).status ===
@@ -716,6 +716,80 @@ try {
     `a pending checkout blocks deletion -> ${
       midCheckout instanceof ProductMutationError ? midCheckout.code : String(midCheckout)
     }`,
+  );
+
+  // The refusal above is about money that may still land against the listing.
+  // A checkout the buyer walked away from is different: once its hold lapses
+  // it protects nobody, and it used to block edit and delete until the
+  // cron-driven sweep ran — which, locally, is never. The product mutations
+  // now clear the listing's lapsed holds themselves.
+  const lapsedSeller = await makeUser("lapsedseller");
+  const lapsedProduct = await makeProduct(lapsedSeller.id, 10_000);
+  const lapsedRaffle = await createRaffle({
+    productId: lapsedProduct.id,
+    sellerId: lapsedSeller.id,
+    ticketPriceMinor: TICKET_PRICE,
+    totalTickets: 10,
+    closesAt: new Date(Date.now() + 86_400_000),
+  });
+  made.raffles.push(lapsedRaffle.id);
+
+  const walker = await makeUser("walker");
+  const walked = await reserveTickets({
+    raffleId: lapsedRaffle.id,
+    userId: walker.id,
+    quantity: 2,
+    customerEmail: `walker.${tag}@test.invalid`,
+  });
+
+  // While the hold is live the checkout genuinely is in progress.
+  const liveBlock = await updateProduct(lapsedProduct.id, { title: "Too soon" })
+    .then(() => null)
+    .catch((e: unknown) => e);
+  check(
+    liveBlock instanceof ProductMutationError &&
+      liveBlock.code === "CHECKOUT_IN_PROGRESS",
+    `a live hold still blocks an edit -> ${
+      liveBlock instanceof ProductMutationError ? liveBlock.code : String(liveBlock)
+    }`,
+  );
+
+  // The buyer leaves and the clock runs out.
+  await prisma.ticket.updateMany({
+    where: { raffleId: lapsedRaffle.id, status: "RESERVED" },
+    data: { reservationExpiresAt: new Date(Date.now() - 1000) },
+  });
+
+  await updateProduct(lapsedProduct.id, { title: "Edited after the hold lapsed" });
+  check(
+    (await prisma.product.findUniqueOrThrow({
+      where: { id: lapsedProduct.id },
+      select: { title: true },
+    })).title === "Edited after the hold lapsed",
+    "an expired checkout no longer blocks an edit",
+  );
+
+  // The edit swept the debris the same way the cron would have: rows deleted,
+  // payment abandoned, so a charge landing late records reservation_lost
+  // instead of buying tickets against the reworded listing.
+  check(
+    (await prisma.ticket.count({ where: { raffleId: lapsedRaffle.id } })) === 0,
+    "the lapsed hold's rows were deleted by the edit's own sweep",
+  );
+  const walkedPayment = await prisma.payment.findUniqueOrThrow({
+    where: { reference: walked.reference },
+    select: { status: true, failureReason: true },
+  });
+  check(
+    walkedPayment.status === "ABANDONED" &&
+      walkedPayment.failureReason === "reservation_expired",
+    `and its payment was marked abandoned -> ${walkedPayment.status}/${String(walkedPayment.failureReason)}`,
+  );
+
+  const lapsedDelete = await archiveProduct(lapsedProduct.id, lapsedSeller.id);
+  check(
+    lapsedDelete.cancelledRaffleIds.includes(lapsedRaffle.id),
+    "deleting then goes through, cancelling the never-paid-into raffle",
   );
 
   // Raising the stated value above what a live raffle can raise would leave a

@@ -2,6 +2,7 @@ import { isOwnCloudinaryUrl } from "../images/cloudinary.js";
 import { prisma } from "../lib/prisma.js";
 import { JOB_TYPES } from "../jobs/handlers.js";
 import { enqueueJob } from "../jobs/queue.js";
+import { releaseExpiredReservations } from "./tickets.js";
 import type { Prisma, ProductCondition } from "../generated/prisma/client.js";
 
 type Tx = Prisma.TransactionClient;
@@ -91,13 +92,28 @@ export interface EditableProduct {
  *
  * Their payment would land against a listing that no longer says what they
  * bought, so both edits and withdrawal wait rather than racing it. Unlike the
- * paid-ticket refusals this one clears on its own once the reservation sweep
- * collects the hold, which is why it reads as a separate code.
+ * paid-ticket refusals this one clears on its own once the hold runs out,
+ * which is why it reads as a separate code.
+ *
+ * A checkout whose hold has already lapsed is not "in progress" — the buyer
+ * left, and only the cron-driven sweep (or the next reservation on that
+ * raffle) would ever flip its payment to ABANDONED. Waiting on either would
+ * block the seller indefinitely, so the listing's expired holds are cleared
+ * here first, the same way `reserveTickets` clears its own raffle's. Doing it
+ * inside this transaction also closes the late-payment window: once the rows
+ * are deleted, a charge that lands anyway records `reservation_lost` instead
+ * of claiming tickets against a listing that just changed under it.
+ *
+ * A PENDING payment with no tickets at all — the `reservation_lost` state —
+ * still blocks, deliberately: that is money sitting at the provider waiting
+ * for a human, and the listing it was paid against should hold still.
  */
 async function assertNoCheckoutInFlight(
   tx: Tx,
   productId: string,
 ): Promise<void> {
+  await releaseExpiredReservations({ productId }, tx);
+
   const pending = await tx.payment.count({
     where: { raffle: { productId }, status: "PENDING" },
   });
