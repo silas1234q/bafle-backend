@@ -78,8 +78,15 @@ export const env = {
   // Overridable so tests can point the driver at a local stub, and so a
   // proxy or regional endpoint can be used without a code change.
   PAYSTACK_BASE_URL: process.env.PAYSTACK_BASE_URL ?? null,
-  // Where Paystack returns the buyer after checkout.
-  PAYSTACK_CALLBACK_URL: process.env.PAYSTACK_CALLBACK_URL ?? null,
+  // Where the provider sends the BUYER's browser after checkout — our /paid
+  // page on the frontend, never this API. Nothing to do with any one provider
+  // despite the old name: Moolre takes it as a hosted link's `redirect`, and
+  // Paystack took it as `callback_url`.
+  //
+  // PAYSTACK_CALLBACK_URL is still read so an environment configured under
+  // the old name keeps working; prefer PAYMENT_RETURN_URL.
+  PAYMENT_RETURN_URL:
+    process.env.PAYMENT_RETURN_URL ?? process.env.PAYSTACK_CALLBACK_URL ?? null,
 
   // Moolre. Nullable and validated on first use, same reasoning as Paystack's
   // keys: missing payment config must not stop the catalogue and auth routes
@@ -284,13 +291,18 @@ if (IS_PRODUCTION) {
   // so their payment is never confirmed from the browser and their reserved
   // numbers are never released when they back out — both silent, and both
   // only visible as "people paid and got nothing".
-  if (!process.env.PAYSTACK_CALLBACK_URL) {
+  const returnUrl =
+    process.env.PAYMENT_RETURN_URL ?? process.env.PAYSTACK_CALLBACK_URL;
+  if (!returnUrl) {
     problems.push(
-      "PAYSTACK_CALLBACK_URL must be set in production; without it buyers are never returned to the site after paying",
+      "PAYMENT_RETURN_URL must be set in production; without it buyers are never returned to the site after paying. It is the FRONTEND /paid URL, not this API",
     );
-  } else if (/localhost|127.0.0.1/.test(process.env.PAYSTACK_CALLBACK_URL)) {
+    // Plain substring checks rather than a regex: the thing being guarded
+    // against is a copied-over dev value, and a regex here has been a source
+    // of escaping bugs for no benefit.
+  } else if (returnUrl.includes("localhost") || returnUrl.includes("127.0.0.1")) {
     problems.push(
-      "PAYSTACK_CALLBACK_URL points at localhost but NODE_ENV=production; every paying buyer would be redirected to their own machine",
+      "PAYMENT_RETURN_URL points at localhost but NODE_ENV=production; every paying buyer would be redirected to their own machine",
     );
   }
 

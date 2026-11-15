@@ -24,7 +24,7 @@ import { PaymentProviderError } from "../payments/provider.js";
  * `reference` it finds, and both carry the same value.
  */
 function buyerReturnUrl(reference: string): string | undefined {
-  const base = env.PAYSTACK_CALLBACK_URL;
+  const base = env.PAYMENT_RETURN_URL;
   if (!base) return undefined;
 
   try {
